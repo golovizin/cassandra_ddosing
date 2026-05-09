@@ -1,0 +1,68 @@
+# NodePort сервисы для прямого доступа к каждому поду Cassandra
+# 3 ноды (порты 30000-30002)
+
+---
+# Нода 0
+apiVersion: v1
+kind: Service
+metadata:
+  name: cassandra-0-nodeport
+  namespace: cassandra
+  labels:
+    app: cassandra
+    node: "0"
+spec:
+  type: NodePort
+  ports:
+    - name: cql
+      port: 9042  # Внутренний порт кластера
+      targetPort: 9042  # Порт контейнера
+      nodePort: 30000  # Внешний порт на ноде minikube
+      protocol: TCP
+  selector:
+    app.kubernetes.io/name: cassandra
+    statefulset.kubernetes.io/pod-name: cassandra-0  # Селектор для конкретного пода StatefulSet
+
+---
+# Нода 1
+apiVersion: v1
+kind: Service
+metadata:
+  name: cassandra-1-nodeport
+  namespace: cassandra
+  labels:
+    app: cassandra
+    node: "1"
+spec:
+  type: NodePort
+  ports:
+    - name: cql
+      port: 9042
+      targetPort: 9042
+      nodePort: 30001
+      protocol: TCP
+  selector:
+    app.kubernetes.io/name: cassandra
+    statefulset.kubernetes.io/pod-name: cassandra-1
+
+---
+# Нода 2
+apiVersion: v1
+kind: Service
+metadata:
+  name: cassandra-2-nodeport
+  namespace: cassandra
+  labels:
+    app: cassandra
+    node: "2"
+spec:
+  type: NodePort
+  ports:
+    - name: cql
+      port: 9042
+      targetPort: 9042
+      nodePort: 30002
+      protocol: TCP
+  selector:
+    app.kubernetes.io/name: cassandra
+    statefulset.kubernetes.io/pod-name: cassandra-2

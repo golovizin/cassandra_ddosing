@@ -1,0 +1,97 @@
+# Конфигурация для kubelauncher/cassandra chart
+# https://github.com/kubelauncher/charts/tree/main/charts/cassandra
+# Используем Cassandra 5.0.8 (образ по умолчанию из chart)
+
+# Количество реплик (нод в кластере)
+replicaCount: 3
+
+# Имя кластера Cassandra
+clusterName: "test-cluster"
+
+# Дата-центр
+datacenter: "dc1"
+
+# Rack (стойка в дата-центре)
+rack: "rack1"
+
+# Snitch для определения топологии кластера
+# SimpleSnitch - для single-DC кластера
+endpointSnitch: "SimpleSnitch"
+
+# Настройки JVM heap
+# maxHeapSize - максимальный размер heap (рекомендуется 1/4 от RAM)
+maxHeapSize: "1G"
+# heapNewSize - размер young generation (не рекомендуется с G1 GC в Cassandra 5.x)
+heapNewSize: ""
+
+# Настройки ресурсов
+# resourcesPreset: "small" | "medium" | "large" | "xlarge"
+# Или можно задать вручную через resources
+resourcesPreset: "small"
+resources:
+  limits:
+    cpu: 1000m
+    memory: 2Gi
+  requests:
+    cpu: 500m
+    memory: 1Gi
+
+# Настройки персистентного хранилища
+persistence:
+  enabled: true  # Включить persistent volumes
+  size: 8Gi  # Размер диска на каждую ноду
+  storageClass: ""  # Использовать default storage class
+  accessModes:
+    - ReadWriteOnce  # Режим доступа к volume
+  mountPath: /data/cassandra  # Путь монтирования в контейнере
+
+# Настройки сервиса
+service:
+  type: ClusterIP  # NodePort будет создан отдельным манифестом
+  ports:
+    cql: 9042  # Порт для CQL-подключений
+    intraNode: 7000  # Порт для межузловой коммуникации
+    tlsIntraNode: 7001  # Порт для TLS межузловой коммуникации
+
+# Настройки безопасности pod
+podSecurityContext:
+  enabled: true
+  fsGroup: 1001  # Group ID для файловой системы
+
+# Настройки безопасности контейнера
+containerSecurityContext:
+  enabled: true
+  runAsUser: 1001  # User ID для запуска процесса
+  runAsGroup: 1001  # Group ID для запуска процесса
+  runAsNonRoot: true  # Запрет запуска от root
+  allowPrivilegeEscalation: false  # Запрет повышения привилегий
+  readOnlyRootFilesystem: false  # Разрешить запись в root filesystem
+  capabilities:
+    drop: ["ALL"]  # Убрать все capabilities
+  seccompProfile:
+    type: RuntimeDefault  # Использовать default seccomp profile
+
+# Настройки проб (health checks)
+startupProbe:
+  enabled: true
+  initialDelaySeconds: 60  # Задержка перед первой проверкой
+  periodSeconds: 10  # Интервал между проверками
+  timeoutSeconds: 10  # Таймаут проверки
+  failureThreshold: 30  # Количество неудачных попыток до рестарта
+  successThreshold: 1  # Количество успешных попыток для считания готовым
+
+livenessProbe:
+  enabled: true
+  initialDelaySeconds: 60
+  periodSeconds: 30
+  timeoutSeconds: 10
+  failureThreshold: 5
+  successThreshold: 1
+
+readinessProbe:
+  enabled: true
+  initialDelaySeconds: 60
+  periodSeconds: 10
+  timeoutSeconds: 10
+  failureThreshold: 5
+  successThreshold: 1
