@@ -292,13 +292,30 @@ fi
 
 echo "Device: $DEV ($MAJOR_MINOR)"
 
-# Применяем throttling ко всем процессам Cassandra
-pgrep -f cassandra | while read pid; do
+# Определяем cgroup-prefix PID 1 — граница нашего cgroup namespace внутри minikube
+ROOT_CG=$(awk -F: '/blkio/{{print $3}}' /proc/1/cgroup 2>/dev/null | head -1)
+ROOT_CG="${{ROOT_CG%/}}"
+
+# Применяем throttling к процессам Cassandra (только в kubepods cgroup)
+# Используем точное имя класса, чтобы не захватить посторонние SSH-сессии
+pgrep -f 'CassandraDaemon' | while read pid; do
     CG=$(awk -F: '/blkio/{{print $3}}' /proc/$pid/cgroup 2>/dev/null | head -1)
-    [ -n "$CG" ] && \\
-    echo "$MAJOR_MINOR {limit_bytes_per_sec}" | tee /sys/fs/cgroup/blkio$CG/blkio.throttle.write_bps_device > /dev/null && \\
+    [ -z "$CG" ] && continue
+    # Пропускаем процессы не в kubepods (например, сам SSH-сеанс)
+    echo "$CG" | grep -q 'kubepods' || continue
+    # Убираем корневой prefix, чтобы получить путь относительно нашего cgroup namespace
+    if [ -n "$ROOT_CG" ] && [ "$ROOT_CG" != "/" ]; then
+        CG="${{CG#$ROOT_CG}}"
+    fi
+    [ -z "$CG" ] && CG="/"
+    CGROUP_PATH="/sys/fs/cgroup/blkio${{CG%/}}"
+    if [ ! -d "$CGROUP_PATH" ]; then
+        echo "✗ PID $pid: cgroup dir not found: $CGROUP_PATH"
+        continue
+    fi
+    echo "$MAJOR_MINOR {limit_bytes_per_sec}" | tee "$CGROUP_PATH/blkio.throttle.write_bps_device" > /dev/null && \\
     echo "✓ PID $pid: $MAJOR_MINOR {limit_bytes_per_sec} bytes/s"
-done
+done || true
 """
     
     if dry_run:
@@ -363,13 +380,27 @@ fi
 
 echo "Device: $DEV ($MAJOR_MINOR)"
 
-# Снимаем throttling со всех процессов Cassandra
-pgrep -f cassandra | while read pid; do
+# Определяем cgroup-prefix PID 1 — граница нашего cgroup namespace внутри minikube
+ROOT_CG=$(awk -F: '/blkio/{print $3}' /proc/1/cgroup 2>/dev/null | head -1)
+ROOT_CG="${ROOT_CG%/}"
+
+# Снимаем throttling с процессов Cassandra (только в kubepods cgroup)
+pgrep -f 'CassandraDaemon' | while read pid; do
     CG=$(awk -F: '/blkio/{print $3}' /proc/$pid/cgroup 2>/dev/null | head -1)
-    [ -n "$CG" ] && \\
-    echo "$MAJOR_MINOR 0" | tee /sys/fs/cgroup/blkio$CG/blkio.throttle.write_bps_device > /dev/null && \\
+    [ -z "$CG" ] && continue
+    echo "$CG" | grep -q 'kubepods' || continue
+    if [ -n "$ROOT_CG" ] && [ "$ROOT_CG" != "/" ]; then
+        CG="${CG#$ROOT_CG}"
+    fi
+    [ -z "$CG" ] && CG="/"
+    CGROUP_PATH="/sys/fs/cgroup/blkio${CG%/}"
+    if [ ! -d "$CGROUP_PATH" ]; then
+        echo "✗ PID $pid: cgroup dir not found: $CGROUP_PATH"
+        continue
+    fi
+    echo "$MAJOR_MINOR 0" | tee "$CGROUP_PATH/blkio.throttle.write_bps_device" > /dev/null && \\
     echo "✓ PID $pid: throttling removed"
-done
+done || true
 """
     
     if dry_run:
@@ -407,7 +438,7 @@ def cli():
 
 
 @cli.command(name="set-limit")
-@click.argument("limit_mbps", type=float)
+@click.argument("limit_mbps", type=float, default=0.2, required=False)
 @click.option(
     "--namespace",
     default="cassandra",
@@ -425,22 +456,22 @@ def cli():
 def set_limit(limit_mbps: float, namespace: str, pod: str, dry_run: bool):
     """
     Устанавливает ограничение скорости записи на диск.
-    
-    LIMIT_MBPS - лимит скорости записи в мегабайтах в секунду
-    
+
+    LIMIT_MBPS - лимит в МБ/сек (по умолчанию: 0.2)
+
     \b
     Примеры:
-      # Установить лимит 1 МБ/сек для всех Cassandra-подов
+      # Установить лимит по умолчанию (0.2 МБ/сек)
+      set_cassandra_throttling.py set-limit
+
+      # Установить лимит 1 МБ/сек
       set_cassandra_throttling.py set-limit 1
-      
-      # Установить лимит 5 МБ/сек
-      set_cassandra_throttling.py set-limit 5
-      
+
       # Установить лимит только для конкретного пода
-      set_cassandra_throttling.py set-limit 1 --pod cassandra-0
-      
+      set_cassandra_throttling.py set-limit 0.2 --pod cassandra-0
+
       # Показать команды без выполнения
-      set_cassandra_throttling.py set-limit 1 --dry-run
+      set_cassandra_throttling.py set-limit --dry-run
     """
     limit_bytes_per_sec = int(limit_mbps * 1024 * 1024)
     

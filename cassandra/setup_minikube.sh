@@ -6,7 +6,7 @@ sudo sysctl fs.inotify.max_user_watches=524288
 sudo sysctl fs.inotify.max_user_instances=512
 
 # Поехали...
-minikube start --driver=docker --cpus=6 --memory=32g --disk-size=60g --docker-opt default-ulimit=nofile=65536:65536
+minikube start --driver=docker --cpus=14 --memory=64g --disk-size=100g --docker-opt default-ulimit=nofile=65536:65536
 
 minikube addons enable metrics-server
 # To avoid PVC errors

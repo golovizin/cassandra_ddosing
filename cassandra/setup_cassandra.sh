@@ -71,19 +71,19 @@ for i in {1..60}; do
     sleep 5
 done
 
-# Проверка доступности Cassandra через CQL
+# Проверка доступности Cassandra через nodetool (cqlsh не работает с Python 3.14+)
 echo ""
 echo "=== Проверка доступности Cassandra ==="
 
-echo "Проверка CQL-подключения к ${RELEASE}-0..."
+echo "Проверка через nodetool на ${RELEASE}-0..."
 for i in {1..30}; do
-    if kubectl exec -n "$NAMESPACE" "${RELEASE}-0" -- cqlsh -u cassandra -p cassandra -e "DESCRIBE KEYSPACES" > /dev/null 2>&1; then
-        echo "✓ CQL-подключение успешно (попытка $i)"
+    if kubectl exec -n "$NAMESPACE" "${RELEASE}-0" -- nodetool status > /dev/null 2>&1; then
+        echo "✓ Cassandra доступна (попытка $i)"
         break
     fi
-    
-    echo "Ожидание CQL... (попытка $i/30)"
-    sleep 2
+
+    echo "Ожидание nodetool... (попытка $i/30)"
+    sleep 5
 done
 
 # Вывод информации о кластере

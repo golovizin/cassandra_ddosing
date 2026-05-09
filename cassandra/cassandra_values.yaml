@@ -20,26 +20,25 @@ endpointSnitch: "SimpleSnitch"
 
 # Настройки JVM heap
 # maxHeapSize - максимальный размер heap (рекомендуется 1/4 от RAM)
-maxHeapSize: "1G"
+maxHeapSize: "6G"
 # heapNewSize - размер young generation (не рекомендуется с G1 GC в Cassandra 5.x)
-heapNewSize: ""
+#heapNewSize: ""
 
 # Настройки ресурсов
-# resourcesPreset: "small" | "medium" | "large" | "xlarge"
-# Или можно задать вручную через resources
-resourcesPreset: "small"
+# resourcesPreset отключён: ресурсы заданы явно через resources
+resourcesPreset: ""
 resources:
   limits:
-    cpu: 1000m
-    memory: 2Gi
+    memory: 10Gi
+    # cpu limit не выставляется намеренно — даём Cassandra брать сколько нужно
   requests:
-    cpu: 500m
-    memory: 1Gi
+    cpu: 3000m
+    memory: 4Gi
 
 # Настройки персистентного хранилища
 persistence:
   enabled: true  # Включить persistent volumes
-  size: 8Gi  # Размер диска на каждую ноду
+  size: 16Gi  # Размер диска на каждую ноду
   storageClass: ""  # Использовать default storage class
   accessModes:
     - ReadWriteOnce  # Режим доступа к volume
@@ -81,17 +80,12 @@ startupProbe:
   successThreshold: 1  # Количество успешных попыток для считания готовым
 
 livenessProbe:
-  enabled: true
-  initialDelaySeconds: 60
-  periodSeconds: 30
-  timeoutSeconds: 10
-  failureThreshold: 5
-  successThreshold: 1
+  enabled: false  # Отключён: под дисковой нагрузкой nodetool таймаутится и вызывает рестарты
 
 readinessProbe:
   enabled: true
   initialDelaySeconds: 60
   periodSeconds: 10
-  timeoutSeconds: 10
-  failureThreshold: 5
+  timeoutSeconds: 30   # Увеличен для стабильности под нагрузкой
+  failureThreshold: 10 # Увеличен: больше терпимости к временным задержкам
   successThreshold: 1

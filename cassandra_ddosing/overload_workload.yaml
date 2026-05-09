@@ -1,0 +1,129 @@
+# overload_workload.yaml
+#
+# NoSQLBench (nb5) workload для перегрузки Cassandra при дисковом лимите 1 МБ/с.
+# Используется совместно с run_overload.sh.
+#
+# Размер одной строки ~6-7 КБ:
+#   5 текстовых колонок × 512 байт → 1024 hex-символа = ~1 КБ каждая  → ~5 КБ
+#   1 blob-колонка (1024 байта)                                          → ~1 КБ
+#   8 числовых колонок (int/bigint/float/double)                         → ~64 байт
+#   4 ключевые колонки (bigint/int)                                       → ~24 байт
+#
+# Прямой запуск (без run_overload.sh):
+#   ./nb5 run driver=cqld4 workload=overload_workload.yaml tags==block:schema_ks \
+#     host=minikube-docker port=30000 localdc=datacenter1 \
+#     username=cassandra password=cassandra cycles=1 threads=1
+#   ./nb5 run driver=cqld4 workload=overload_workload.yaml tags==block:schema_tbl \
+#     host=minikube-docker port=30000 localdc=datacenter1 \
+#     username=cassandra password=cassandra cycles=1 threads=1
+#   ./nb5 run driver=cqld4 workload=overload_workload.yaml tags==block:main \
+#     host=minikube-docker port=30000 localdc=datacenter1 \
+#     username=cassandra password=cassandra threads=64 cycles=9999999999 errors=warn
+
+scenarios:
+  # Шаги запускаются отдельными вызовами nb5 из run_overload.sh.
+  # cyclerate и cycles передаются через CLI (одинарный =) — это надёжнее,
+  # чем == в scenario-блоке: nb5 не гарантирует применение cyclerate из сценария.
+
+bindings:
+  # Partition keys — высокая кардинальность для равномерного распределения по токен-рингу
+  pk1: HashRange(0L, 500000L)
+  pk2: HashRange(0L, 9999L); ToInt()
+
+  # Clustering keys
+  ck1: HashRange(0L, 100000L)
+  ck2: HashRange(0L, 999L); ToInt()
+
+  # Числовые колонки — разнородные типы
+  col_int1:    Hash(); ToInt()
+  col_int2:    Hash(); ToInt()
+  col_bigint1: Hash()
+  col_bigint2: Hash()
+  col_float1:  Hash(); ToFloat()
+  col_float2:  Hash(); ToFloat()
+  col_double1: Hash(); ToDouble()
+  col_double2: Hash(); ToDouble()
+
+  # Текстовые колонки: HashedToByteBuffer(512) → 512 случайных байт → 1024 hex-символа
+  col_text1: HashedToByteBuffer(512); ToHexString()
+  col_text2: HashedToByteBuffer(512); ToHexString()
+  col_text3: HashedToByteBuffer(512); ToHexString()
+  col_text4: HashedToByteBuffer(512); ToHexString()
+  col_text5: HashedToByteBuffer(512); ToHexString()
+
+  # Blob-колонка: 1024 случайных байта (бинарные данные)
+  col_blob1: HashedToByteBuffer(1024)
+
+blocks:
+  # ── Шаг 1: создание keyspace ──────────────────────────────────────────────
+  schema_ks:
+    params:
+      prepared: false
+    ops:
+      create_ks: |
+        CREATE KEYSPACE IF NOT EXISTS overload_ks
+        WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 3}
+
+  # ── Шаг 2: создание таблицы ───────────────────────────────────────────────
+  schema_tbl:
+    params:
+      prepared: false
+    ops:
+      create_tbl: |
+        CREATE TABLE IF NOT EXISTS overload_ks.wide_table (
+          pk1        bigint,
+          pk2        int,
+          ck1        bigint,
+          ck2        int,
+          col_int1   int,
+          col_int2   int,
+          col_bigint1 bigint,
+          col_bigint2 bigint,
+          col_float1  float,
+          col_float2  float,
+          col_double1 double,
+          col_double2 double,
+          col_text1   text,
+          col_text2   text,
+          col_text3   text,
+          col_text4   text,
+          col_text5   text,
+          col_blob1   blob,
+          PRIMARY KEY ((pk1, pk2), ck1, ck2)
+        )
+
+  # ── Шаг 3: основная нагрузка (INSERT без ограничения скорости) ────────────
+  main:
+    params:
+      prepared: true
+      cl: LOCAL_QUORUM
+    ops:
+      insert_wide: |
+        INSERT INTO overload_ks.wide_table (
+          pk1, pk2, ck1, ck2,
+          col_int1, col_int2, col_bigint1, col_bigint2,
+          col_float1, col_float2, col_double1, col_double2,
+          col_text1, col_text2, col_text3, col_text4, col_text5,
+          col_blob1
+        ) VALUES (
+          {pk1}, {pk2}, {ck1}, {ck2},
+          {col_int1}, {col_int2}, {col_bigint1}, {col_bigint2},
+          {col_float1}, {col_float2}, {col_double1}, {col_double2},
+          {col_text1}, {col_text2}, {col_text3}, {col_text4}, {col_text5},
+          {col_blob1}
+        )
+
+  # ── Шаг 4: чтение записанных данных (верификация после краша нод) ─────────
+  # Использует те же bindings, что и запись → те же partition/clustering keys.
+  # После убийства всех нод данные в memory commitlog теряются,
+  # и эти SELECT возвращают пустой результат вместо ранее записанных строк.
+  read:
+    params:
+      prepared: true
+      cl: LOCAL_QUORUM
+    ops:
+      select_row: |
+        SELECT pk1, pk2, ck1, ck2
+        FROM overload_ks.wide_table
+        WHERE pk1 = {pk1} AND pk2 = {pk2}
+          AND ck1 = {ck1} AND ck2 = {ck2}

@@ -1,1 +1,1 @@
-delete minikube
+minikube delete
