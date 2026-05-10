@@ -4,15 +4,23 @@ run_overload_with_pyspark.py
 
 Нагрузочный тест Cassandra через PySpark + Spark Cassandra Connector.
 
-Запуск:
-    python cassandra_ddosing/run_overload_with_pyspark.py
-    python cassandra_ddosing/run_overload_with_pyspark.py --batches 5 --batch-size 50000
+Команды:
+    # Создать keyspace
+    uv run cassandra_ddosing/run_overload_with_pyspark.py create-keyspace overload_ks
+    
+    # Создать таблицу
+    uv run cassandra_ddosing/run_overload_with_pyspark.py create-table overload_ks.overload_tbl
+    
+    # Запустить нагрузку
+    uv run cassandra_ddosing/run_overload_with_pyspark.py run-overload overload_ks.overload_tbl \
+        --batches 10 --batch-size 100000 --consistency-level LOCAL_QUORUM --concurrent-writes 5
 """
 
-import argparse
 import os
+import sys
 import time
 
+import click
 from cassandra import ConsistencyLevel
 from cassandra.auth import PlainTextAuthProvider
 from cassandra.cluster import Cluster
@@ -28,39 +36,22 @@ PORT = 30000
 USERNAME = "cassandra"
 PASSWORD = "cassandra"
 LOCAL_DC = "datacenter1"
-KEYSPACE = "overload_ks"
-TABLE = "overload_tbl"
 
 # ── Параметры нагрузки ────────────────────────────────────────────────────────
 DEFAULT_DF_BATCH_SIZE = 100_000
 DEFAULT_DF_COUNT = 10
+DDL_TIMEOUT = 300  # секунд — DDL под дросселированием диска выполняется долго
 
 # ~490 символов × 2 поля ≈ 980 байт текста + числовые поля ≈ 1 КБ на строку
 _STR1 = "a" * 490
 _STR2 = "b" * 490
 
 
-def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Cassandra PySpark overload test")
-    p.add_argument(
-        "--batch-size",
-        type=int,
-        default=DEFAULT_DF_BATCH_SIZE,
-        help=f"Строк в каждом датафрейме (по умолчанию {DEFAULT_DF_BATCH_SIZE:,})",
-    )
-    p.add_argument(
-        "--batches",
-        type=int,
-        default=DEFAULT_DF_COUNT,
-        help=f"Количество датафреймов (по умолчанию {DEFAULT_DF_COUNT})",
-    )
-    return p.parse_args()
-
-
-# ── Шаг 1: создание схемы через Python Cassandra Driver ───────────────────────
+# ── Подключение к Cassandra ───────────────────────────────────────────────────
 
 
 def cassandra_connect():
+    """Создаёт подключение к Cassandra."""
     auth = PlainTextAuthProvider(USERNAME, PASSWORD)
     cluster = Cluster(
         contact_points=[HOST],
@@ -68,61 +59,35 @@ def cassandra_connect():
         auth_provider=auth,
         load_balancing_policy=DCAwareRoundRobinPolicy(local_dc=LOCAL_DC),
         protocol_version=4,
-        # При дросселировании диска Cassandra отвечает медленно;
-        # отключаем heartbeat чтобы соединение не признавалось defunct.
         idle_heartbeat_interval=0,
         connect_timeout=60,
     )
     session = cluster.connect()
     session.default_consistency_level = ConsistencyLevel.LOCAL_QUORUM
-    session.default_timeout = 300  # 5 минут — DDL на медленном диске
+    session.default_timeout = DDL_TIMEOUT
     return cluster, session
 
 
-DDL_TIMEOUT = 300  # секунд — DDL под дросселированием диска выполняется долго
-
-
-def setup_schema(session) -> None:
-    session.execute(f"DROP KEYSPACE IF EXISTS {KEYSPACE}", timeout=DDL_TIMEOUT)
-    session.execute(
-        f"CREATE KEYSPACE {KEYSPACE} "
-        f"WITH replication = {{'class': 'SimpleStrategy', 'replication_factor': 2}}",
-        timeout=DDL_TIMEOUT,
-    )
-    session.set_keyspace(KEYSPACE)
-    session.execute(f"DROP TABLE IF EXISTS {TABLE}", timeout=DDL_TIMEOUT)
-    session.execute(
-        f"""
-        CREATE TABLE {TABLE} (
-            id    bigint PRIMARY KEY,
-            num1  int,
-            num2  int,
-            num3  int,
-            str1  text,
-            str2  text
-        )
-        """,
-        timeout=DDL_TIMEOUT,
-    )
-    # Ждём schema propagation по всем нодам
-    deadline = time.monotonic() + DDL_TIMEOUT
+def wait_for_table(session, keyspace: str, table: str, timeout: float = DDL_TIMEOUT) -> None:
+    """Ждёт schema propagation таблицы по всем нодам."""
+    deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         rows = list(
             session.execute(
-                "SELECT table_name FROM system_schema.tables " "WHERE keyspace_name=%s AND table_name=%s",
-                (KEYSPACE, TABLE),
+                "SELECT table_name FROM system_schema.tables WHERE keyspace_name=%s AND table_name=%s",
+                (keyspace, table),
             )
         )
         if rows:
             return
         time.sleep(0.3)
-    raise TimeoutError(f"Таблица {KEYSPACE}.{TABLE} не появилась за {DDL_TIMEOUT} с")
+    raise TimeoutError(f"Таблица {keyspace}.{table} не появилась за {timeout:.0f} с")
 
 
 # ── Шаг 2: создание Spark-сессии ──────────────────────────────────────────────
 
 
-def build_spark() -> SparkSession:
+def build_spark(consistency_level: str = "LOCAL_QUORUM", concurrent_writes: int = 8) -> SparkSession:
     jars_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "jars")
     jars = ",".join(os.path.join(jars_dir, f) for f in sorted(os.listdir(jars_dir)) if f.endswith(".jar"))
 
@@ -138,9 +103,9 @@ def build_spark() -> SparkSession:
         # Spark Cassandra Connector
         .config("spark.cassandra.connection.host", HOST)
         .config("spark.cassandra.connection.port", str(PORT))
-        .config("spark.cassandra.output.concurrent.writes", "8")
-        .config("spark.cassandra.output.consistency.level", "LOCAL_QUORUM")
-        .config("spark.cassandra.input.consistency.level", "LOCAL_QUORUM")
+        .config("spark.cassandra.output.concurrent.writes", str(concurrent_writes))
+        .config("spark.cassandra.output.consistency.level", consistency_level)
+        .config("spark.cassandra.input.consistency.level", consistency_level)
         .config("spark.cassandra.auth.username", USERNAME)
         .config("spark.cassandra.auth.password", PASSWORD)
         # read.timeout_ms управляет таймаутом и записи тоже (10 минут)
@@ -169,75 +134,209 @@ def make_dataframe(spark: SparkSession, batch_idx: int, batch_size: int):
     )
 
 
-# ── main ──────────────────────────────────────────────────────────────────────
+# ── CLI ───────────────────────────────────────────────────────────────────────
 
 
-def main():
-    args = parse_args()
-    df_batch_size: int = args.batch_size
-    df_count: int = args.batches
-    total_rows = df_batch_size * df_count
+@click.group()
+def cli():
+    """Нагрузочный тест Cassandra через PySpark + Spark Cassandra Connector."""
+    pass
 
-    print("=== Cassandra PySpark overload ===\n")
-    print(f"  Батчей:    {df_count}")
-    print(f"  Строк/батч:{df_batch_size:>12,}")
-    print(f"  Итого:     {total_rows:>12,}\n")
 
-    # 1) Схема
-    print("[1/4] Подключение к Cassandra и создание схемы...")
+@cli.command(name="create-keyspace")
+@click.argument("keyspace_name")
+@click.option("--replication-factor", default=2, help="Replication factor (по умолчанию 2)")
+@click.option("--drop-if-exists", is_flag=True, help="Удалить keyspace если существует")
+def create_keyspace(keyspace_name: str, replication_factor: int, drop_if_exists: bool):
+    """Создаёт keyspace в Cassandra."""
+    click.echo(f"{'=' * 70}")
+    click.echo(f"Создание keyspace: {keyspace_name}")
+    click.echo(f"{'=' * 70}")
+    click.echo(f"Replication factor: {replication_factor}")
+    click.echo(f"Drop if exists: {drop_if_exists}")
+    click.echo(f"{'=' * 70}\n")
+
     cluster, session = cassandra_connect()
-    setup_schema(session)
-    cluster.shutdown()
-    print("[1/4] OK\n")
+    
+    try:
+        if drop_if_exists:
+            click.echo(f"Удаление keyspace {keyspace_name} (если существует)...")
+            session.execute(f"DROP KEYSPACE IF EXISTS {keyspace_name}", timeout=DDL_TIMEOUT)
+            click.echo("✓ Удалён\n")
+        
+        click.echo(f"Создание keyspace {keyspace_name}...")
+        session.execute(
+            f"CREATE KEYSPACE IF NOT EXISTS {keyspace_name} "
+            f"WITH replication = {{'class': 'SimpleStrategy', 'replication_factor': {replication_factor}}}",
+            timeout=DDL_TIMEOUT,
+        )
+        click.echo("✓ Создан\n")
+        
+        click.echo(f"{'=' * 70}")
+        click.echo(f"✓ Keyspace {keyspace_name} готов")
+        click.echo(f"{'=' * 70}")
+    finally:
+        cluster.shutdown()
 
-    # 2) Spark
-    print("[2/4] Создание Spark-сессии...")
-    spark = build_spark()
-    print(f"[2/4] OK  (Spark {spark.version})\n")
 
-    # 3) Список датафреймов (ленивые планы — данные не материализуются)
-    print("[3/4] Формирование списка датафреймов...")
-    dataframes = [make_dataframe(spark, i, df_batch_size) for i in range(df_count)]
-    print(f"[3/4] Сформировано {len(dataframes)} датафреймов\n")
+@cli.command(name="create-table")
+@click.argument("table_path")
+@click.option("--drop-if-exists", is_flag=True, help="Удалить таблицу если существует")
+def create_table(table_path: str, drop_if_exists: bool):
+    """
+    Создаёт таблицу в Cassandra.
+    
+    TABLE_PATH в формате keyspace.table (например, overload_ks.overload_tbl)
+    """
+    if "." not in table_path:
+        click.echo(f"✗ Ошибка: TABLE_PATH должен быть в формате keyspace.table", err=True)
+        sys.exit(1)
+    
+    keyspace, table = table_path.split(".", 1)
+    
+    click.echo(f"{'=' * 70}")
+    click.echo(f"Создание таблицы: {keyspace}.{table}")
+    click.echo(f"{'=' * 70}")
+    click.echo(f"Drop if exists: {drop_if_exists}")
+    click.echo(f"{'=' * 70}\n")
 
-    # 4) Запись в Cassandra
-    print("[4/4a] Запись датафреймов в Cassandra (append)...")
+    cluster, session = cassandra_connect()
+    
+    try:
+        session.set_keyspace(keyspace)
+        
+        if drop_if_exists:
+            click.echo(f"Удаление таблицы {table} (если существует)...")
+            session.execute(f"DROP TABLE IF EXISTS {table}", timeout=DDL_TIMEOUT)
+            click.echo("✓ Удалена\n")
+        
+        click.echo(f"Создание таблицы {table}...")
+        session.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {table} (
+                id    bigint PRIMARY KEY,
+                num1  int,
+                num2  int,
+                num3  int,
+                str1  text,
+                str2  text
+            )
+            """,
+            timeout=DDL_TIMEOUT,
+        )
+        click.echo("✓ Создана\n")
+        
+        click.echo("Ожидание schema propagation...")
+        wait_for_table(session, keyspace, table)
+        click.echo("✓ Schema propagated\n")
+        
+        click.echo(f"{'=' * 70}")
+        click.echo(f"✓ Таблица {keyspace}.{table} готова")
+        click.echo(f"{'=' * 70}")
+    finally:
+        cluster.shutdown()
+
+
+@cli.command(name="run-overload")
+@click.argument("table_path")
+@click.option("--batches", default=DEFAULT_DF_COUNT, help=f"Количество батчей (по умолчанию {DEFAULT_DF_COUNT})")
+@click.option("--batch-size", default=DEFAULT_DF_BATCH_SIZE, help=f"Строк в батче (по умолчанию {DEFAULT_DF_BATCH_SIZE:,})")
+@click.option(
+    "--consistency-level",
+    type=click.Choice(["LOCAL_QUORUM", "QUORUM", "ONE", "ALL"], case_sensitive=False),
+    default="LOCAL_QUORUM",
+    help="Consistency level для записи",
+)
+@click.option("--concurrent-writes", default=8, help="Параллельных записей в Spark Cassandra Connector")
+def run_overload(table_path: str, batches: int, batch_size: int, consistency_level: str, concurrent_writes: int):
+    """
+    Запускает нагрузочный тест записи в Cassandra.
+    
+    TABLE_PATH в формате keyspace.table (например, overload_ks.overload_tbl)
+    """
+    if "." not in table_path:
+        click.echo(f"✗ Ошибка: TABLE_PATH должен быть в формате keyspace.table", err=True)
+        sys.exit(1)
+    
+    keyspace, table = table_path.split(".", 1)
+    total_rows = batches * batch_size
+
+    click.echo("=" * 70)
+    click.echo("Cassandra PySpark overload")
+    click.echo("=" * 70)
+    click.echo(f"Таблица:           {keyspace}.{table}")
+    click.echo(f"Батчей:            {batches}")
+    click.echo(f"Строк/батч:        {batch_size:>12,}")
+    click.echo(f"Итого:             {total_rows:>12,}")
+    click.echo(f"Consistency level: {consistency_level}")
+    click.echo(f"Concurrent writes: {concurrent_writes}")
+    click.echo("=" * 70)
+    click.echo()
+
+    # Spark
+    click.echo("[1/3] Создание Spark-сессии...")
+    spark = build_spark(consistency_level=consistency_level, concurrent_writes=concurrent_writes)
+    click.echo(f"[1/3] ✓ OK  (Spark {spark.version})\n")
+
+    # Список датафреймов
+    click.echo("[2/3] Формирование списка датафреймов...")
+    dataframes = [make_dataframe(spark, i, batch_size) for i in range(batches)]
+    click.echo(f"[2/3] ✓ Сформировано {len(dataframes)} датафреймов\n")
+
+    # Запись в Cassandra
+    click.echo("[3/3a] Запись датафреймов в Cassandra (append)...")
     t_write_start = time.monotonic()
     for i, df in enumerate(dataframes):
         t0 = time.monotonic()
-        (
-            df.write.format("org.apache.spark.sql.cassandra")
-            .options(table=TABLE, keyspace=KEYSPACE)
-            .mode("append")
-            .save()
-        )
+        df.write.format("org.apache.spark.sql.cassandra").options(table=table, keyspace=keyspace).mode("append").save()
         elapsed = time.monotonic() - t0
-        print(f"  Батч {i + 1}/{df_count}: {df_batch_size:,} строк за {elapsed:.1f} с")
+        click.echo(f"  Батч {i + 1}/{batches}: {batch_size:,} строк за {elapsed:.1f} с")
 
     total_write = time.monotonic() - t_write_start
-    print(f"  Всего запись: {total_write:.1f} с\n")
+    click.echo(f"  Всего запись: {total_write:.1f} с\n")
 
-    # 5) Верификация
-    print("[4/4b] Чтение и верификация...")
+    # Верификация
+    click.echo("[3/3b] Чтение и верификация...")
     t0 = time.monotonic()
-    result_df = spark.read.format("org.apache.spark.sql.cassandra").options(table=TABLE, keyspace=KEYSPACE).load()
+    result_df = spark.read.format("org.apache.spark.sql.cassandra").options(table=table, keyspace=keyspace).load()
     actual = result_df.count()
     elapsed = time.monotonic() - t0
 
     expected = total_rows
     ok = actual == expected
-    print(f"  Чтение: {elapsed:.1f} с")
-    print(f"  Ожидалось: {expected:,}")
-    print(f"  Получено:  {actual:,}")
+    click.echo(f"  Чтение: {elapsed:.1f} с")
+    click.echo(f"  Ожидалось: {expected:,}")
+    click.echo(f"  Получено:  {actual:,}")
+    
     if ok:
-        print("  Статус: OK — все строки на месте")
+        click.echo("  Статус: ✓ OK — все строки на месте")
     else:
         lost = expected - actual
-        print(f"  Статус: НЕСООТВЕТСТВИЕ — потеряно {lost:,} строк ({lost / expected * 100:.2f}%)")
+        loss_pct = lost / expected * 100
+        click.echo(f"  Статус: ✗ НЕСООТВЕТСТВИЕ — потеряно {lost:,} строк ({loss_pct:.2f}%)")
+        click.echo(f"\n  ⚠️  ВОСПРОИЗВЕДЕНА ПРОБЛЕМА: данные потеряны при записи с {consistency_level}!")
+        
+        # Детальная диагностика
+        click.echo("\n  Анализ пропущенных строк...")
+        all_ids = result_df.select("id").rdd.map(lambda r: r.id).collect()
+        all_ids_set = set(all_ids)
+        expected_ids = set(range(1, total_rows + 1))
+        missing_ids = sorted(expected_ids - all_ids_set)
+        
+        if missing_ids:
+            click.echo(f"  Первые 20 пропущенных ID: {missing_ids[:20]}")
+            click.echo(f"  Последние 20 пропущенных ID: {missing_ids[-20:]}")
+            
+            gaps = []
+            for i in range(1, min(len(missing_ids), 100)):
+                gaps.append(missing_ids[i] - missing_ids[i - 1])
+            if gaps:
+                avg_gap = sum(gaps) / len(gaps)
+                click.echo(f"  Средний интервал между пропусками (первые 100): {avg_gap:.1f}")
 
     spark.stop()
-    print("\nГотово.")
+    click.echo("\nГотово.")
 
 
 if __name__ == "__main__":
-    main()
+    cli()
