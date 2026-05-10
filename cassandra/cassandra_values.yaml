@@ -29,7 +29,7 @@ maxHeapSize: "6G"
 resourcesPreset: ""
 resources:
   limits:
-    memory: 10Gi
+    memory: 12Gi
     # cpu limit не выставляется намеренно — даём Cassandra брать сколько нужно
   requests:
     cpu: 3000m
@@ -38,7 +38,7 @@ resources:
 # Настройки персистентного хранилища
 persistence:
   enabled: true  # Включить persistent volumes
-  size: 16Gi  # Размер диска на каждую ноду
+  size: 20Gi  # Размер диска на каждую ноду
   storageClass: ""  # Использовать default storage class
   accessModes:
     - ReadWriteOnce  # Режим доступа к volume
@@ -83,9 +83,4 @@ livenessProbe:
   enabled: false  # Отключён: под дисковой нагрузкой nodetool таймаутится и вызывает рестарты
 
 readinessProbe:
-  enabled: true
-  initialDelaySeconds: 60
-  periodSeconds: 10
-  timeoutSeconds: 30   # Увеличен для стабильности под нагрузкой
-  failureThreshold: 10 # Увеличен: больше терпимости к временным задержкам
-  successThreshold: 1
+  enabled: false  # Отключён: под дисковой нагрузкой nodetool таймаутится и вызывает рестарты

@@ -31,12 +31,12 @@ KEYSPACE = "overload_ks"
 TABLE = "overload_tbl"
 
 # ── Нагрузка (можно переопределить через CLI) ─────────────────────────────────
-DEFAULT_TOTAL_ROWS = 100_000  # строк по умолчанию
-DEFAULT_RATE_LIMIT_MBPS = 3.0  # МБ/с, лимит скорости записи
+DEFAULT_TOTAL_ROWS = 300_000  # строк по умолчанию
+DEFAULT_RATE_LIMIT_MBPS = 30.0  # МБ/с, лимит скорости записи
 
 # ── Внутренние параметры ──────────────────────────────────────────────────────
 ROW_SIZE_BYTES = 10_000  # приблизительный размер одной строки (2 × 5000 байт текста)
-CONCURRENCY = 256  # параллельных запросов в полёте одновременно
+CONCURRENCY = 64  # параллельных запросов в полёте одновременно
 CHUNK_SIZE = 1_000  # строк за одну «порцию»; sleep считается после каждой порции
 
 # ~5 КБ текста × 2 поля = ~10 КБ на строку (ASCII, 1 байт/символ)
@@ -77,6 +77,21 @@ def connect() -> tuple:
     return cluster, session
 
 
+def wait_for_table(session, keyspace: str, table: str, timeout: float = 30.0) -> None:
+    """Ждёт, пока таблица станет доступна на всех нодах (schema propagation)."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        rows = list(session.execute(
+            "SELECT table_name FROM system_schema.tables "
+            "WHERE keyspace_name=%s AND table_name=%s",
+            (keyspace, table),
+        ))
+        if rows:
+            return
+        time.sleep(0.2)
+    raise TimeoutError(f"Таблица {keyspace}.{table} не появилась за {timeout:.0f}с")
+
+
 def setup_schema(session) -> None:
     session.execute(
         f"CREATE KEYSPACE IF NOT EXISTS {KEYSPACE} "
@@ -96,6 +111,7 @@ def setup_schema(session) -> None:
         )
     """
     )
+    wait_for_table(session, KEYSPACE, TABLE)
 
 
 def write_rows(session, total_rows: int, rate_mbps: float) -> int:
@@ -128,7 +144,15 @@ def write_rows(session, total_rows: int, rate_mbps: float) -> int:
 
         args = [(i, i % 1_000, i % 500, i % 100, _TEXT, _TEXT) for i in range(chunk_start, chunk_end)]
         results = execute_concurrent_with_args(session, stmt, args, concurrency=CONCURRENCY, raise_on_first_error=False)
-        chunk_errors = sum(1 for ok, _ in results if not ok)
+        first_exc = None
+        chunk_errors = 0
+        for ok, val in results:
+            if not ok:
+                chunk_errors += 1
+                if first_exc is None:
+                    first_exc = val
+        if first_exc is not None:
+            print(f"    [exc] {type(first_exc).__name__}: {first_exc}")
         total_errors += chunk_errors
 
         # ── Ограничение скорости: ждём до конца расчётного интервала ─────────
