@@ -1,9 +1,14 @@
 # Конфигурация для kubelauncher/cassandra chart
 # https://github.com/kubelauncher/charts/tree/main/charts/cassandra
 # Используем Cassandra 5.0.8 (образ по умолчанию из chart)
+# Примечание: версия 4.0.3 недоступна в kubelauncher/cassandra
 
 # Количество реплик (нод в кластере)
 replicaCount: 3
+
+# Политика управления подами: OrderedReady для последовательного запуска
+# Это предотвращает ошибку "Other bootstrapping/leaving/moving nodes detected"
+podManagementPolicy: OrderedReady
 
 # Имя кластера Cassandra
 clusterName: "test-cluster"
@@ -30,9 +35,10 @@ resourcesPreset: ""
 resources:
   limits:
     memory: 12Gi
+    cpu: 400m
     # cpu limit не выставляется намеренно — даём Cassandra брать сколько нужно
   requests:
-    cpu: 3000m
+    cpu: 200m
     memory: 4Gi
 
 # Настройки персистентного хранилища
@@ -84,3 +90,37 @@ livenessProbe:
 
 readinessProbe:
   enabled: false  # Отключён: под дисковой нагрузкой nodetool таймаутится и вызывает рестарты
+
+# Кастомная конфигурация Cassandra
+# Используем initContainer с sed для модификации write_request_timeout в cassandra.yaml
+
+# Монтируем /opt/cassandra/conf как emptyDir для возможности модификации
+extraVolumes:
+  - name: cassandra-conf
+    emptyDir: {}
+
+extraVolumeMounts:
+  - name: cassandra-conf
+    mountPath: /opt/cassandra/conf
+
+# initContainer для модификации cassandra.yaml
+initContainers:
+  - name: config-modifier
+    image: ghcr.io/kubelauncher/cassandra:5.0.8
+    command:
+      - sh
+      - -c
+      - |
+        echo "Копирование стандартных конфигов из /opt/cassandra/conf..."
+        cp -r /opt/cassandra/conf/* /cassandra-conf-target/
+        
+        echo "Модификация write_request_timeout: 2000ms -> 100ms"
+        sed -i 's/^write_request_timeout:.*/write_request_timeout: 100ms/' /cassandra-conf-target/cassandra.yaml
+        
+        echo "Проверка изменений:"
+        grep "write_request_timeout" /cassandra-conf-target/cassandra.yaml
+        
+        echo "✓ Конфигурация готова"
+    volumeMounts:
+      - name: cassandra-conf
+        mountPath: /cassandra-conf-target

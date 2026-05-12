@@ -32,13 +32,39 @@ fi
 # Проверка, установлен ли Calico через Helm
 echo ""
 echo "Проверка наличия Calico Helm release..."
-if helm list -n "$CALICO_NAMESPACE" 2>/dev/null | grep -q "$CALICO_RELEASE"; then
+if helm list -A 2>/dev/null | grep -q "$CALICO_RELEASE"; then
     echo "✓ Найден Helm release: $CALICO_RELEASE"
     
-    # Удаление через Helm
+    # Принудительное удаление зависших uninstall jobs
+    echo ""
+    echo "=== Очистка зависших uninstall jobs ==="
+    UNINSTALL_JOBS=$(kubectl get jobs -n "$CALICO_NAMESPACE" -o name 2>/dev/null | grep uninstall || echo "")
+    if [ -n "$UNINSTALL_JOBS" ]; then
+        echo "Удаление зависших jobs..."
+        echo "$UNINSTALL_JOBS" | xargs kubectl delete -n "$CALICO_NAMESPACE" --ignore-not-found=true --force --grace-period=0 2>/dev/null || true
+        echo "✓ Jobs удалены"
+    else
+        echo "✓ Зависших jobs не найдено"
+    fi
+    
+    # Принудительное удаление Calico Installation CRD
+    echo ""
+    echo "=== Удаление Calico Installation ==="
+    if kubectl get installation default > /dev/null 2>&1; then
+        echo "Удаление installation default..."
+        kubectl delete installation default --ignore-not-found=true --timeout=10s 2>/dev/null || true
+        # Если не удалилось, удаляем с finalizers
+        kubectl patch installation default -p '{"metadata":{"finalizers":[]}}' --type=merge 2>/dev/null || true
+        kubectl delete installation default --ignore-not-found=true --force --grace-period=0 2>/dev/null || true
+        echo "✓ Installation удалён"
+    else
+        echo "✓ Installation не найден"
+    fi
+    
+    # Удаление через Helm (без ожидания, если зависло)
     echo ""
     echo "=== Удаление Calico через Helm ==="
-    helm uninstall "$CALICO_RELEASE" -n "$CALICO_NAMESPACE" --wait --timeout 5m
+    helm uninstall "$CALICO_RELEASE" -n "$CALICO_NAMESPACE" --wait=false 2>/dev/null || true
     
     echo "✓ Helm release удалён"
 else
@@ -55,16 +81,31 @@ else
     fi
 fi
 
-# Удаление namespace tigera-operator
+# Удаление всех Calico namespaces
 echo ""
-echo "=== Удаление namespace $CALICO_NAMESPACE ==="
-if kubectl get namespace "$CALICO_NAMESPACE" > /dev/null 2>&1; then
-    echo "Удаление namespace..."
-    kubectl delete namespace "$CALICO_NAMESPACE" --timeout=60s || true
-    echo "✓ Namespace удалён"
-else
-    echo "✓ Namespace не найден"
-fi
+echo "=== Удаление Calico namespaces ==="
+for NS in "calico-system" "calico-apiserver" "tigera-operator"; do
+    if kubectl get namespace "$NS" > /dev/null 2>&1; then
+        echo "Удаление namespace $NS..."
+        
+        # Принудительно удаляем все ресурсы внутри (без ожидания)
+        kubectl delete all --all -n "$NS" --force --grace-period=0 --wait=false 2>/dev/null || true
+        
+        # Удаляем finalizers у namespace
+        kubectl patch namespace "$NS" -p '{"metadata":{"finalizers":[]}}' --type=merge 2>/dev/null || true
+        
+        # Запускаем удаление namespace в фоне (без ожидания)
+        kubectl delete namespace "$NS" --wait=false 2>/dev/null &
+        
+        echo "✓ Запущено удаление namespace $NS"
+    else
+        echo "✓ Namespace $NS не найден"
+    fi
+done
+
+# Даём время на начало удаления
+echo "Ожидание начала удаления..."
+sleep 5
 
 # Ожидание завершения удаления подов
 echo ""

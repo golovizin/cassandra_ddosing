@@ -7,13 +7,17 @@ run_overload_with_pyspark.py
 Команды:
     # Создать keyspace
     uv run cassandra_ddosing/run_overload_with_pyspark.py create-keyspace overload_ks
-    
+
     # Создать таблицу
     uv run cassandra_ddosing/run_overload_with_pyspark.py create-table overload_ks.overload_tbl
-    
+
     # Запустить нагрузку
     uv run cassandra_ddosing/run_overload_with_pyspark.py run-overload overload_ks.overload_tbl \
         --batches 10 --batch-size 100000 --consistency-level LOCAL_QUORUM --concurrent-writes 5
+
+    # Вычитать и верифицировать данные
+    uv run cassandra_ddosing/run_overload_with_pyspark.py readout overload_ks.overload_tbl \
+        --expected-rows 1000000 --consistency-level LOCAL_QUORUM
 """
 
 import os
@@ -87,7 +91,9 @@ def wait_for_table(session, keyspace: str, table: str, timeout: float = DDL_TIME
 # ── Шаг 2: создание Spark-сессии ──────────────────────────────────────────────
 
 
-def build_spark(consistency_level: str = "LOCAL_QUORUM", concurrent_writes: int = 8) -> SparkSession:
+def build_spark(
+    consistency_level: str = "LOCAL_QUORUM", concurrent_writes: int = 16, read_timeout_ms: int = 600000
+) -> SparkSession:
     jars_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "jars")
     jars = ",".join(os.path.join(jars_dir, f) for f in sorted(os.listdir(jars_dir)) if f.endswith(".jar"))
 
@@ -108,8 +114,7 @@ def build_spark(consistency_level: str = "LOCAL_QUORUM", concurrent_writes: int 
         .config("spark.cassandra.input.consistency.level", consistency_level)
         .config("spark.cassandra.auth.username", USERNAME)
         .config("spark.cassandra.auth.password", PASSWORD)
-        # read.timeout_ms управляет таймаутом и записи тоже (10 минут)
-        .config("spark.cassandra.read.timeout_ms", "600000")
+        .config("spark.cassandra.read.timeout_ms", str(read_timeout_ms))
         .getOrCreate()
     )
 
@@ -157,13 +162,13 @@ def create_keyspace(keyspace_name: str, replication_factor: int, drop_if_exists:
     click.echo(f"{'=' * 70}\n")
 
     cluster, session = cassandra_connect()
-    
+
     try:
         if drop_if_exists:
             click.echo(f"Удаление keyspace {keyspace_name} (если существует)...")
             session.execute(f"DROP KEYSPACE IF EXISTS {keyspace_name}", timeout=DDL_TIMEOUT)
             click.echo("✓ Удалён\n")
-        
+
         click.echo(f"Создание keyspace {keyspace_name}...")
         session.execute(
             f"CREATE KEYSPACE IF NOT EXISTS {keyspace_name} "
@@ -171,7 +176,7 @@ def create_keyspace(keyspace_name: str, replication_factor: int, drop_if_exists:
             timeout=DDL_TIMEOUT,
         )
         click.echo("✓ Создан\n")
-        
+
         click.echo(f"{'=' * 70}")
         click.echo(f"✓ Keyspace {keyspace_name} готов")
         click.echo(f"{'=' * 70}")
@@ -185,15 +190,15 @@ def create_keyspace(keyspace_name: str, replication_factor: int, drop_if_exists:
 def create_table(table_path: str, drop_if_exists: bool):
     """
     Создаёт таблицу в Cassandra.
-    
+
     TABLE_PATH в формате keyspace.table (например, overload_ks.overload_tbl)
     """
     if "." not in table_path:
         click.echo(f"✗ Ошибка: TABLE_PATH должен быть в формате keyspace.table", err=True)
         sys.exit(1)
-    
+
     keyspace, table = table_path.split(".", 1)
-    
+
     click.echo(f"{'=' * 70}")
     click.echo(f"Создание таблицы: {keyspace}.{table}")
     click.echo(f"{'=' * 70}")
@@ -201,15 +206,15 @@ def create_table(table_path: str, drop_if_exists: bool):
     click.echo(f"{'=' * 70}\n")
 
     cluster, session = cassandra_connect()
-    
+
     try:
         session.set_keyspace(keyspace)
-        
+
         if drop_if_exists:
             click.echo(f"Удаление таблицы {table} (если существует)...")
             session.execute(f"DROP TABLE IF EXISTS {table}", timeout=DDL_TIMEOUT)
             click.echo("✓ Удалена\n")
-        
+
         click.echo(f"Создание таблицы {table}...")
         session.execute(
             f"""
@@ -225,13 +230,13 @@ def create_table(table_path: str, drop_if_exists: bool):
             timeout=DDL_TIMEOUT,
         )
         click.echo("✓ Создана\n")
-        
+
         click.echo("Ожидание schema propagation...")
         wait_for_table(session, keyspace, table)
         click.echo("✓ Schema propagated\n")
-        
+
         click.echo(f"{'=' * 70}")
-        click.echo(f"✓ Таблица {keyspace}.{table} готова")
+        click.echo(f"✓ Таблица {keyspace}.{table} готва")
         click.echo(f"{'=' * 70}")
     finally:
         cluster.shutdown()
@@ -240,24 +245,26 @@ def create_table(table_path: str, drop_if_exists: bool):
 @cli.command(name="run-overload")
 @click.argument("table_path")
 @click.option("--batches", default=DEFAULT_DF_COUNT, help=f"Количество батчей (по умолчанию {DEFAULT_DF_COUNT})")
-@click.option("--batch-size", default=DEFAULT_DF_BATCH_SIZE, help=f"Строк в батче (по умолчанию {DEFAULT_DF_BATCH_SIZE:,})")
+@click.option(
+    "--batch-size", default=DEFAULT_DF_BATCH_SIZE, help=f"Строк в батче (по умолчанию {DEFAULT_DF_BATCH_SIZE:,})"
+)
 @click.option(
     "--consistency-level",
     type=click.Choice(["LOCAL_QUORUM", "QUORUM", "ONE", "ALL"], case_sensitive=False),
     default="LOCAL_QUORUM",
     help="Consistency level для записи",
 )
-@click.option("--concurrent-writes", default=8, help="Параллельных записей в Spark Cassandra Connector")
+@click.option("--concurrent-writes", default=12, help="Параллельных записей в Spark Cassandra Connector")
 def run_overload(table_path: str, batches: int, batch_size: int, consistency_level: str, concurrent_writes: int):
     """
     Запускает нагрузочный тест записи в Cassandra.
-    
+
     TABLE_PATH в формате keyspace.table (например, overload_ks.overload_tbl)
     """
     if "." not in table_path:
         click.echo(f"✗ Ошибка: TABLE_PATH должен быть в формате keyspace.table", err=True)
         sys.exit(1)
-    
+
     keyspace, table = table_path.split(".", 1)
     total_rows = batches * batch_size
 
@@ -284,7 +291,7 @@ def run_overload(table_path: str, batches: int, batch_size: int, consistency_lev
     click.echo(f"[2/3] ✓ Сформировано {len(dataframes)} датафреймов\n")
 
     # Запись в Cassandra
-    click.echo("[3/3a] Запись датафреймов в Cassandra (append)...")
+    click.echo("[3/3] Запись датафреймов в Cassandra (append)...")
     t_write_start = time.monotonic()
     for i, df in enumerate(dataframes):
         t0 = time.monotonic()
@@ -295,44 +302,101 @@ def run_overload(table_path: str, batches: int, batch_size: int, consistency_lev
     total_write = time.monotonic() - t_write_start
     click.echo(f"  Всего запись: {total_write:.1f} с\n")
 
-    # Верификация
-    click.echo("[3/3b] Чтение и верификация...")
+    spark.stop()
+    click.echo("\nГотово.")
+    click.echo(
+        f"\nДля верификации запустите:\n  uv run cassandra_ddosing/run_overload_with_pyspark.py readout {table_path} --expected-rows {total_rows}"
+    )
+
+
+@cli.command(name="readout")
+@click.argument("table_path")
+@click.option("--expected-rows", type=int, help="Ожидаемое количество строк (для верификации)")
+@click.option(
+    "--consistency-level",
+    type=click.Choice(["LOCAL_QUORUM", "QUORUM", "ONE", "ALL"], case_sensitive=False),
+    default="LOCAL_QUORUM",
+    help="Consistency level для чтения",
+)
+@click.option("--read-timeout", default=600000, help="Таймаут чтения в миллисекундах (по умолчанию 600000 = 10 минут)")
+def readout(table_path: str, expected_rows: int, consistency_level: str, read_timeout: int):
+    """
+    Вычитывает данные из таблицы и верифицирует количество строк.
+
+    TABLE_PATH в формате keyspace.table (например, overload_ks.overload_tbl)
+    """
+    if "." not in table_path:
+        click.echo(f"✗ Ошибка: TABLE_PATH должен быть в формате keyspace.table", err=True)
+        sys.exit(1)
+
+    keyspace, table = table_path.split(".", 1)
+
+    click.echo("=" * 70)
+    click.echo("Вычитка и верификация данных")
+    click.echo("=" * 70)
+    click.echo(f"Таблица:           {keyspace}.{table}")
+    click.echo(f"Consistency level: {consistency_level}")
+    click.echo(f"Read timeout:      {read_timeout} мс ({read_timeout/1000:.0f} с)")
+    if expected_rows:
+        click.echo(f"Ожидается строк:   {expected_rows:,}")
+    click.echo("=" * 70)
+    click.echo()
+
+    # Spark
+    click.echo("[1/2] Создание Spark-сессии...")
+    spark = build_spark(consistency_level=consistency_level, read_timeout_ms=read_timeout)
+    click.echo(f"[1/2] ✓ OK  (Spark {spark.version})\n")
+
+    # Чтение и верификация
+    click.echo("[2/2] Чтение и верификация...")
     t0 = time.monotonic()
     result_df = spark.read.format("org.apache.spark.sql.cassandra").options(table=table, keyspace=keyspace).load()
     actual = result_df.count()
     elapsed = time.monotonic() - t0
 
-    expected = total_rows
-    ok = actual == expected
     click.echo(f"  Чтение: {elapsed:.1f} с")
-    click.echo(f"  Ожидалось: {expected:,}")
-    click.echo(f"  Получено:  {actual:,}")
-    
-    if ok:
-        click.echo("  Статус: ✓ OK — все строки на месте")
+    click.echo(f"  Получено строк: {actual:,}")
+
+    if expected_rows is not None:
+        ok = actual == expected_rows
+        click.echo(f"  Ожидалось:      {expected_rows:,}")
+
+        if ok:
+            click.echo("  Статус: ✓ OK — все строки на месте")
+        else:
+            lost = expected_rows - actual
+            loss_pct = abs(lost) / expected_rows * 100
+            if lost > 0:
+                click.echo(f"  Статус: ✗ НЕСООТВЕТСТВИЕ — потеряно {lost:,} строк ({loss_pct:.2f}%)")
+                click.echo(f"\n  ⚠️  ВОСПРОИЗВЕДЕНА ПРОБЛЕМА: данные потеряны при записи с {consistency_level}!")
+            else:
+                click.echo(f"  Статус: ✗ НЕСООТВЕТСТВИЕ — лишних {-lost:,} строк ({loss_pct:.2f}%)")
+
+            # Детальная диагностика
+            click.echo("\n  Анализ пропущенных строк...")
+            all_ids = result_df.select("id").rdd.map(lambda r: r.id).collect()
+            all_ids_set = set(all_ids)
+            expected_ids = set(range(1, expected_rows + 1))
+            missing_ids = sorted(expected_ids - all_ids_set)
+
+            if missing_ids:
+                click.echo(f"  Пропущенных ID: {len(missing_ids):,}")
+                click.echo(f"  Первые 20 пропущенных ID: {missing_ids[:20]}")
+                click.echo(f"  Последние 20 пропущенных ID: {missing_ids[-20:]}")
+
+                gaps = []
+                for i in range(1, min(len(missing_ids), 100)):
+                    gaps.append(missing_ids[i] - missing_ids[i - 1])
+                if gaps:
+                    avg_gap = sum(gaps) / len(gaps)
+                    click.echo(f"  Средний интервал между пропусками (первые 100): {avg_gap:.1f}")
+
+            # Проверка дубликатов
+            duplicates = len(all_ids) - len(all_ids_set)
+            if duplicates > 0:
+                click.echo(f"\n  ⚠️  Обнаружено {duplicates:,} дубликатов ID")
     else:
-        lost = expected - actual
-        loss_pct = lost / expected * 100
-        click.echo(f"  Статус: ✗ НЕСООТВЕТСТВИЕ — потеряно {lost:,} строк ({loss_pct:.2f}%)")
-        click.echo(f"\n  ⚠️  ВОСПРОИЗВЕДЕНА ПРОБЛЕМА: данные потеряны при записи с {consistency_level}!")
-        
-        # Детальная диагностика
-        click.echo("\n  Анализ пропущенных строк...")
-        all_ids = result_df.select("id").rdd.map(lambda r: r.id).collect()
-        all_ids_set = set(all_ids)
-        expected_ids = set(range(1, total_rows + 1))
-        missing_ids = sorted(expected_ids - all_ids_set)
-        
-        if missing_ids:
-            click.echo(f"  Первые 20 пропущенных ID: {missing_ids[:20]}")
-            click.echo(f"  Последние 20 пропущенных ID: {missing_ids[-20:]}")
-            
-            gaps = []
-            for i in range(1, min(len(missing_ids), 100)):
-                gaps.append(missing_ids[i] - missing_ids[i - 1])
-            if gaps:
-                avg_gap = sum(gaps) / len(gaps)
-                click.echo(f"  Средний интервал между пропусками (первые 100): {avg_gap:.1f}")
+        click.echo("  Статус: ✓ Чтение выполнено (верификация пропущена)")
 
     spark.stop()
     click.echo("\nГотово.")

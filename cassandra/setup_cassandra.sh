@@ -34,6 +34,23 @@ else
     echo "✓ Namespace '$NAMESPACE' создан"
 fi
 
+# Создание ConfigMap с кастомным cassandra.yaml
+echo ""
+echo "=== Создание ConfigMap с кастомным cassandra.yaml ==="
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CASSANDRA_YAML="$SCRIPT_DIR/cassandra.yaml"
+
+if [ ! -f "$CASSANDRA_YAML" ]; then
+    echo "⚠ Файл $CASSANDRA_YAML не найден, используется стандартная конфигурация"
+else
+    echo "Создание ConfigMap cassandra-config..."
+    kubectl create configmap cassandra-config \
+        --from-file=cassandra.yaml="$CASSANDRA_YAML" \
+        -n "$NAMESPACE" \
+        --dry-run=client -o yaml | kubectl apply -f -
+    echo "✓ ConfigMap создан"
+fi
+
 # Установка Cassandra (3 ноды)
 echo ""
 echo "=== Установка Cassandra (3 ноды) ==="
@@ -116,3 +133,6 @@ echo "  Нода 2: $MINIKUBE_IP:30002"
 echo ""
 echo "Пример подключения через cqlsh:"
 echo "  cqlsh $MINIKUBE_IP 30000 -u cassandra -p cassandra"
+echo ""
+echo "Проверка кастомной конфигурации:"
+echo "  kubectl exec -n cassandra cassandra-0 -- grep write_request_timeout /opt/cassandra/conf/cassandra.yaml"
